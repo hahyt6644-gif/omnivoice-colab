@@ -7,7 +7,6 @@ import threading
 import tempfile
 import requests
 import subprocess
-import time
 from typing import Any, Dict, Optional
 
 import gradio as gr
@@ -435,36 +434,43 @@ with gr.Blocks(theme=theme, css=css, title="OmniVoice Server") as demo:
 # ---------------------------------------------------------------------------
 app = gr.mount_gradio_app(app, demo, path="/")
 
-def start_localtunnel(port, subdomain):
-    """Starts localtunnel in the background with a specific subdomain."""
-    logger.info(f"Starting Localtunnel on port {port} with subdomain: {subdomain}...")
-    try:
-        process = subprocess.Popen(
-            ["npx", "localtunnel", "--port", str(port), "--subdomain", subdomain],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True
-        )
-        for line in process.stdout:
-            if "your url is" in line.lower():
-                url = line.strip().split(" ")[-1]
+def start_cloudflare_tunnel(port):
+    """Downloads and starts a free Cloudflare tunnel in the background."""
+    logger.info("Setting up Cloudflare tunnel...")
+    
+    # Download cloudflared binary if it doesn't exist
+    if not os.path.exists("./cloudflared"):
+        os.system("wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O cloudflared")
+        os.system("chmod +x cloudflared")
+    
+    logger.info("Starting Cloudflare tunnel...")
+    
+    # Run the tunnel pointing to our local port
+    process = subprocess.Popen(
+        ["./cloudflared", "tunnel", "--url", f"http://127.0.0.1:{port}"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True
+    )
+    
+    # Parse the output to find the public trycloudflare link
+    for line in process.stdout:
+        if "trycloudflare.com" in line:
+            import re
+            match = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", line)
+            if match:
+                url = match.group(0)
                 print(f"\n=======================================================")
                 print(f"🌍 PUBLIC API & UI URL: {url}")
                 print(f"⚡ API DOCS: {url}/docs")
                 print(f"=======================================================\n")
                 break
-    except Exception as e:
-        logger.error(f"Failed to start localtunnel: {e}")
 
 if __name__ == "__main__":
-    # ---------------------------------------------------------
-    # IMPORTANT: CHANGE THIS TO YOUR DESIRED UNIQUE NAME!
-    # ---------------------------------------------------------
-    SUBDOMAIN = "my-unique-omnivoice-api"  # E.g., 'omni-tts-123'
     PORT = 8000
     
-    # Start localtunnel in a background thread
-    threading.Thread(target=start_localtunnel, args=(PORT, SUBDOMAIN), daemon=True).start()
+    # Start the Cloudflare tunnel in a background thread
+    threading.Thread(target=start_cloudflare_tunnel, args=(PORT,), daemon=True).start()
 
     # Start FastAPI server
     logger.info(f"Starting API Server on host 0.0.0.0 and port {PORT}")
