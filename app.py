@@ -306,7 +306,7 @@ from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 import httpx
-
+from starlette.requests import Request
 api_app = FastAPI(title="OmniVoice API", version="1.0.0")
 
 # Serve generated audio files at /audio/<filename>
@@ -363,7 +363,7 @@ def _cleanup(*paths):
 # ---------------------------------------------------------------------------
 @api_app.post("/api/clone")
 async def api_clone(
-    request: Any,
+    request: Request,
     text: str = Form(...),
     language: Optional[str] = Form("Auto"),
     ref_text: Optional[str] = Form(None),
@@ -471,7 +471,7 @@ async def api_clone(
 # ---------------------------------------------------------------------------
 @api_app.post("/api/design")
 async def api_design(
-    request: Any,
+    request: Request,
     text: str = Form(...),
     language: Optional[str] = Form("Auto"),
     want_subs: bool = Form(False),
