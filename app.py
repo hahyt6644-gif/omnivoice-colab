@@ -4,6 +4,10 @@ import logging
 import uuid
 import re
 import threading
+import tempfile
+import requests
+import subprocess
+import time
 from typing import Any, Dict, Optional
 
 import gradio as gr
@@ -16,6 +20,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import uvicorn
+import nest_asyncio
+
+# Apply nest_asyncio so Uvicorn can run inside Colab without blocking
+nest_asyncio.apply()
 
 # Define directory for temp audio
 temp_audio_dir = "./Omni_Audio"
@@ -212,18 +220,45 @@ def health_check():
 
 @app.post("/api/generate/clone")
 def api_generate_clone(req: VoiceCloneRequest):
-    if not os.path.exists(req.ref_audio_path):
-        raise HTTPException(status_code=400, detail="Reference audio path does not exist.")
-        
+    ref_path = req.ref_audio_path
+    temp_download_path = None
+    
+    # 1. Detect if the path is a web URL and download it temporarily
+    if ref_path.startswith("http://") or ref_path.startswith("https://"):
+        try:
+            logger.info(f"Downloading reference audio from URL: {ref_path}")
+            r = requests.get(ref_path, stream=True)
+            r.raise_for_status()
+            
+            tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+            for chunk in r.iter_content(chunk_size=8192):
+                tmp_file.write(chunk)
+            tmp_file.close()
+            
+            ref_path = tmp_file.name
+            temp_download_path = ref_path
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to download audio from URL: {e}")
+            
+    # 2. Otherwise, check if it's a valid local path
+    elif not os.path.exists(ref_path):
+        raise HTTPException(status_code=400, detail="Reference audio path does not exist on the server.")
+
+    # 3. Generate Audio
     res = _gen_core(
-        req.text, req.language, req.ref_audio_path, None, req.num_step, req.guidance_scale, 
+        req.text, req.language, ref_path, None, req.num_step, req.guidance_scale, 
         req.denoise, req.speed, req.duration, req.preprocess_prompt, req.postprocess_output, 
         mode="clone", ref_text=req.ref_text
     )
     
+    # 4. Clean up the downloaded temporary file
+    if temp_download_path and os.path.exists(temp_download_path):
+        os.remove(temp_download_path)
+    
     if res[0] is None:
         raise HTTPException(status_code=500, detail=res[1])
         
+    # 5. Save and return output
     sr, waveform = res[0]
     tmp_wav = tts_file_name(req.text, language=req.language)
     wavfile.write(tmp_wav, sr, waveform)
@@ -271,41 +306,11 @@ EVENT_TAGS = [
     "[dissatisfaction-hnn]"
 ]
 
-INSERT_TAG_JS_VC = """
-(tag_val, current_text) => {
-    const textarea = document.querySelector('#vc_textbox textarea');
-    if (!textarea) return current_text + " " + tag_val;
-    const start = textarea.selectionStart; const end = textarea.selectionEnd;
-    let prefix = " ", suffix = " ";
-    if (!current_text) return tag_val;
-    if (start === 0) prefix = ""; else if (current_text[start - 1] === ' ') prefix = "";
-    if (end < current_text.length && current_text[end] === ' ') suffix = "";
-    return current_text.slice(0, start) + prefix + tag_val + suffix + current_text.slice(end);
-}
-"""
-
-INSERT_TAG_JS_VD = """
-(tag_val, current_text) => {
-    const textarea = document.querySelector('#vd_textbox textarea');
-    if (!textarea) return current_text + " " + tag_val;
-    const start = textarea.selectionStart; const end = textarea.selectionEnd;
-    let prefix = " ", suffix = " ";
-    if (!current_text) return tag_val;
-    if (start === 0) prefix = ""; else if (current_text[start - 1] === ' ') prefix = "";
-    if (end < current_text.length && current_text[end] === ' ') suffix = "";
-    return current_text.slice(0, start) + prefix + tag_val + suffix + current_text.slice(end);
-}
-"""
+INSERT_TAG_JS_VC = """(tag_val, current_text) => { const textarea = document.querySelector('#vc_textbox textarea'); if (!textarea) return current_text + " " + tag_val; const start = textarea.selectionStart; const end = textarea.selectionEnd; let prefix = " ", suffix = " "; if (!current_text) return tag_val; if (start === 0) prefix = ""; else if (current_text[start - 1] === ' ') prefix = ""; if (end < current_text.length && current_text[end] === ' ') suffix = ""; return current_text.slice(0, start) + prefix + tag_val + suffix + current_text.slice(end); }"""
+INSERT_TAG_JS_VD = """(tag_val, current_text) => { const textarea = document.querySelector('#vd_textbox textarea'); if (!textarea) return current_text + " " + tag_val; const start = textarea.selectionStart; const end = textarea.selectionEnd; let prefix = " ", suffix = " "; if (!current_text) return tag_val; if (start === 0) prefix = ""; else if (current_text[start - 1] === ' ') prefix = ""; if (end < current_text.length && current_text[end] === ' ') suffix = ""; return current_text.slice(0, start) + prefix + tag_val + suffix + current_text.slice(end); }"""
 
 _ALL_LANGUAGES = ["Auto"] + sorted(lang_display_name(n) for n in LANG_NAMES)
-_CATEGORIES = {
-    "Gender": ["Male", "Female"],
-    "Age": ["Child", "Teenager", "Young Adult", "Middle-aged", "Elderly"],
-    "Pitch": ["Very Low Pitch", "Low Pitch", "Moderate Pitch", "High Pitch", "Very High Pitch"],
-    "Style": ["Whisper"],
-    "English Accent": ["American Accent", "Australian Accent", "British Accent", "Chinese Accent", "Canadian Accent", "Indian Accent", "Korean Accent", "Portuguese Accent", "Russian Accent", "Japanese Accent"],
-    "Chinese Dialect": ["Henan Dialect", "Shaanxi Dialect", "Sichuan Dialect", "Guizhou Dialect", "Yunnan Dialect", "Guilin Dialect", "Jinan Dialect", "Shijiazhuang Dialect", "Gansu Dialect", "Ningxia Dialect", "Qingdao Dialect", "Northeast Dialect"],
-}
+_CATEGORIES = {"Gender": ["Male", "Female"], "Age": ["Child", "Teenager", "Young Adult", "Middle-aged", "Elderly"], "Pitch": ["Very Low Pitch", "Low Pitch", "Moderate Pitch", "High Pitch", "Very High Pitch"], "Style": ["Whisper"], "English Accent": ["American Accent", "Australian Accent", "British Accent", "Chinese Accent", "Canadian Accent", "Indian Accent", "Korean Accent", "Portuguese Accent", "Russian Accent", "Japanese Accent"], "Chinese Dialect": ["Henan Dialect", "Shaanxi Dialect", "Sichuan Dialect", "Guizhou Dialect", "Yunnan Dialect", "Guilin Dialect", "Jinan Dialect", "Shijiazhuang Dialect", "Gansu Dialect", "Ningxia Dialect", "Qingdao Dialect", "Northeast Dialect"]}
 DIALECT_MAP = {"Henan Dialect": "河南话", "Shaanxi Dialect": "陕西话", "Sichuan Dialect": "四川话", "Guizhou Dialect": "贵州话", "Yunnan Dialect": "云南话", "Guilin Dialect": "桂林话", "Jinan Dialect": "济南话", "Shijiazhuang Dialect": "石家庄话", "Gansu Dialect": "甘肃话", "Ningxia Dialect": "宁夏话", "Qingdao Dialect": "青岛话", "Northeast Dialect": "东北话"}
 _ATTR_INFO = {"English Accent": "Only effective for English speech.", "Chinese Dialect": "Only effective for Chinese speech."}
 
@@ -326,10 +331,10 @@ def _gen_settings():
         po = gr.Checkbox(label="Postprocess Output", value=True)
     return ns, gs, dn, sp, du, pp, po
 
-with gr.Blocks(theme=theme, css=css, title="OmniVoice Cloud") as demo:
+with gr.Blocks(theme=theme, css=css, title="OmniVoice Server") as demo:
     gr.HTML("""
         <div style="text-align: center; margin: 20px auto; max-width: 800px;">
-            <h1 style="font-size: 2.5em; margin-bottom: 5px;">🎙️ OmniVoice Production Platform</h1>
+            <h1 style="font-size: 2.5em; margin-bottom: 5px;">🎙️ OmniVoice API Server</h1>
             <p>UI Accessible directly, API Endpoints exposed transparently at <b>/docs</b></p>
         </div>
     """)
@@ -430,8 +435,37 @@ with gr.Blocks(theme=theme, css=css, title="OmniVoice Cloud") as demo:
 # ---------------------------------------------------------------------------
 app = gr.mount_gradio_app(app, demo, path="/")
 
+def start_localtunnel(port, subdomain):
+    """Starts localtunnel in the background with a specific subdomain."""
+    logger.info(f"Starting Localtunnel on port {port} with subdomain: {subdomain}...")
+    try:
+        process = subprocess.Popen(
+            ["npx", "localtunnel", "--port", str(port), "--subdomain", subdomain],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True
+        )
+        for line in process.stdout:
+            if "your url is" in line.lower():
+                url = line.strip().split(" ")[-1]
+                print(f"\n=======================================================")
+                print(f"🌍 PUBLIC API & UI URL: {url}")
+                print(f"⚡ API DOCS: {url}/docs")
+                print(f"=======================================================\n")
+                break
+    except Exception as e:
+        logger.error(f"Failed to start localtunnel: {e}")
+
 if __name__ == "__main__":
-    # Cloud Run/GCP injects the target port into the environment variable 'PORT'
-    port = int(os.environ.get("PORT", 8080))
-    logger.info(f"Starting Production Server on host 0.0.0.0 and port {port}")
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    # ---------------------------------------------------------
+    # IMPORTANT: CHANGE THIS TO YOUR DESIRED UNIQUE NAME!
+    # ---------------------------------------------------------
+    SUBDOMAIN = "my-unique-omnivoice-api"  # E.g., 'omni-tts-123'
+    PORT = 8000
+    
+    # Start localtunnel in a background thread
+    threading.Thread(target=start_localtunnel, args=(PORT, SUBDOMAIN), daemon=True).start()
+
+    # Start FastAPI server
+    logger.info(f"Starting API Server on host 0.0.0.0 and port {PORT}")
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
